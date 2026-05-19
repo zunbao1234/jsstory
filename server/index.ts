@@ -11,13 +11,11 @@ import type {
   GenerationStreamEvent,
   LanguageMode,
   SceneProfile,
-  ScriptStyle,
   StorySettings,
   StoryboardResult,
-  StoryboardShot,
-  VisualStyle
+  StoryboardShot
 } from "../src/shared/types";
-import { buildChunks, calculateDurationSeconds } from "../src/shared/text";
+import { buildChunks, buildStoryboardChunks, calculateShotDurationSeconds } from "../src/shared/text";
 
 const PORT = Number(process.env.PORT ?? 8787);
 const DEFAULT_MODEL = process.env.OPENAI_MODEL ?? "gpt-5.4";
@@ -25,6 +23,7 @@ const DEFAULT_BASE_URL = process.env.OPENAI_BASE_URL ?? "";
 const PARALLEL_CHUNK_LIMIT = Number(process.env.PARALLEL_CHUNK_LIMIT ?? 2);
 const ANALYSIS_MERGE_BATCH_SIZE = 4;
 const TRANSIENT_REQUEST_RETRIES = 1;
+const MAX_STORYBOARD_SHOTS_PER_CHUNK = 16;
 const RESPONSE_INSTRUCTIONS = "You are a structured generation engine. Follow the user input exactly and return the requested content. For structured outputs, return only data that matches the provided schema.";
 const envApiKey = process.env.OPENAI_API_KEY;
 let runtimeConfig = {
@@ -70,14 +69,14 @@ const shotSchema = z.object({
 });
 
 const storyboardSchema = z.object({
-  shots: z.array(shotSchema),
+  shots: z.array(shotSchema).max(MAX_STORYBOARD_SHOTS_PER_CHUNK),
   notes: z.array(z.string()).max(12)
 });
 type RawStoryboardResult = z.infer<typeof storyboardSchema>;
 
 const settingsSchema = z.object({
-  visualStyle: z.enum(["2D", "3D", "photoreal"]),
-  scriptStyle: z.enum(["爽文", "悬疑", "言情", "玄幻", "都市", "恐怖"]),
+  visualStyle: z.string().trim().min(1),
+  scriptStyle: z.string().trim().min(1),
   language: z.enum(["zh", "en"]),
   readingRate: z.number().positive(),
   readingRateUnit: z.enum(["secondsPerChar", "secondsPerWord"]),
@@ -160,7 +159,7 @@ app.post("/api/storyboard", async (req, res) => {
   try {
     ensureOpenAI();
     const { text, settings, analysis } = storyboardRequestSchema.parse(req.body);
-    const chunks = buildChunks(text);
+    const chunks = buildStoryboardChunks(text, settings.language, settings.readingRate, settings.readingRateUnit);
     const shots = await generateStoryboard(chunks, settings, analysis);
     res.json(shots);
   } catch (error) {
@@ -186,11 +185,12 @@ app.post("/api/generate/stream", async (req, res) => {
   try {
     ensureOpenAI();
     const { text, settings } = analyzeRequestSchema.parse(req.body);
-    const chunks = buildChunks(text);
-    sendEvent({ type: "started", chunkTotal: chunks.length });
-    sendEvent({ type: "analysis_started", chunkTotal: chunks.length });
+    const analysisChunks = buildChunks(text);
+    const storyboardChunks = buildStoryboardChunks(text, settings.language, settings.readingRate, settings.readingRateUnit);
+    sendEvent({ type: "started", chunkTotal: storyboardChunks.length });
+    sendEvent({ type: "analysis_started", chunkTotal: analysisChunks.length });
 
-    const analysis = await analyzeNovel(chunks, settings, {
+    const analysis = await analyzeNovel(analysisChunks, settings, {
       signal: abortController.signal,
       isClosed: () => closed,
       onChunk: (chunkIndex, chunkTotal, completedChunks) => {
@@ -203,9 +203,9 @@ app.post("/api/generate/stream", async (req, res) => {
     if (closed) return;
 
     sendEvent({ type: "analysis_completed", analysis });
-    sendEvent({ type: "storyboard_started", chunkTotal: chunks.length });
+    sendEvent({ type: "storyboard_started", chunkTotal: storyboardChunks.length });
 
-    const storyboard = await generateStoryboardStream(chunks, settings, analysis, (event) => {
+    const storyboard = await generateStoryboardStream(storyboardChunks, settings, analysis, (event) => {
       if (!closed) sendEvent(event);
     }, abortController.signal, () => closed);
     if (!closed) sendEvent({ type: "done", totalShots: storyboard.shots.length, notes: storyboard.notes, shots: storyboard.shots });
@@ -320,16 +320,15 @@ async function generateStoryboard(
     notes.push(...result.notes);
     result.shots.forEach((shot) => {
       const index = allShots.length + 1;
+      const cleanShot = normalizeShotTextFields(shot);
       allShots.push({
-        ...shot,
+        ...cleanShot,
         id: `shot-${index}`,
         index,
         episodeNumber: calculateEpisodeNumber(index, settings.episodeCount, allShots.length + result.shots.length),
-        durationSeconds: calculateDurationSeconds(
-          shot.narration || shot.sourceText,
-          settings.language,
-          settings.readingRate,
-          settings.readingRateUnit
+        durationSeconds: calculateShotDurationSeconds(
+          cleanShot,
+          settings.language
         )
       });
     });
@@ -358,16 +357,15 @@ async function generateStoryboardStream(
       const result = results[nextFlushIndex]!;
       const chunkShots: StoryboardShot[] = result.shots.map((shot) => {
         const index = allShots.length + 1;
+        const cleanShot = normalizeShotTextFields(shot);
         return {
-          ...shot,
+          ...cleanShot,
           id: `shot-${index}`,
           index,
           episodeNumber: calculateEpisodeNumber(index, settings.episodeCount, index),
-          durationSeconds: calculateDurationSeconds(
-            shot.narration || shot.sourceText,
-            settings.language,
-            settings.readingRate,
-            settings.readingRateUnit
+          durationSeconds: calculateShotDurationSeconds(
+            cleanShot,
+            settings.language
           )
         };
       });
@@ -590,21 +588,31 @@ function buildStoryboardPrompt(
   return [
     "你是解说剧分镜导演和提示词工程师。",
     "请只返回符合 schema 的 JSON，不要输出解释。",
-    `语言：${settings.language === "zh" ? "中文" : "英文"}`,
+    `原文语言：${settings.language === "zh" ? "中文" : "英文"}`,
+    "输出要求：prompt 字段必须整体使用中文写作，包括镜头语法、画面细节、摄影机补充状态、声音设计和导演批注。",
+    "例外：narration 字段、sourceText 字段、anchorSentence 字段，以及 prompt 的 [台词/旁白] 行中被中文双引号包裹的旁白/角色对白内容，必须保留原文语言和原文表述；英文原文就保持英文，不要翻译成中文。",
     `剧本风格：${settings.scriptStyle}`,
     `视觉风格：${renderVisualStyle(settings.visualStyle)}`,
     `目标分集数：${settings.episodeCount} 集。请让整体镜头可按剧情节奏拆成 ${settings.episodeCount} 集，每集尽量有明确的小悬念、反转或情绪落点。`,
     `这是第 ${chunkIndex}/${chunkTotal} 段。本段会与其他段并发生成，请只处理本段文本，不要续写未提供内容。`,
     "分镜规则：",
     "1. 先理解每一句旁白的画面功能。",
-    "2. 连续句子如果属于同一画面、同一动作或同一情绪推进，可以归并为一个镜头。",
-    "3. 每个镜头的画面重点必须落在归并句组的最后一句，即 anchorSentence。",
-    "4. narration 应保留这个镜头覆盖的原文旁白，不要改写成剧本对白。",
-    "5. prompt 必须使用下方“镜头提示词格式”，不是普通散文提示词，不要绑定具体平台参数。",
-    "6. 必须参考理解档案，保持人物外貌、服装、场景和时间线一致。",
-    "7. 分集拆分由系统按镜头顺序写入 episodeNumber；你只需要在 notes 中提示适合断集的剧情节点。",
-    "8. 本段最多生成 12 个镜头；如果句子很多，必须合并同场景、同动作或同情绪的连续句子，避免输出过长。",
-    "9. 任何涉及旁白或角色对话的镜头，都必须在 [台词/旁白] 行使用标准引用格式。",
+    "2. 输入已经预先拆成【分镜单元】。短句已经尽量和相邻句合并，每个分镜单元的旁白朗读估算不超过 8 秒；原则上一个分镜单元对应一个镜头。",
+    "3. durationSeconds 表示镜头画面时长，不是旁白阅读时长。单个普通镜头建议 3-6 秒，反应镜头 2-3 秒，场景空镜/建立镜头 2-4 秒。",
+    "4. 单个镜头覆盖的 narration 朗读估算不能超过 8 秒；超过时必须拆成多个镜头。",
+    "5. 不要把已经合并好的短句再拆得过碎；除非人物、动作、视角或场景发生明显切换，否则保持一个分镜单元一个镜头。",
+    "6. 当人物、动作、视角或场景发生切换时，不要直接跨切换合并；需要用第三方反应镜头或场景空镜承接。",
+    "7. 人物切换时，补一个反应镜头：让观察者、旁观者、敌人或被影响者成为画面主体，shotType 写“反应镜头”或“第三方反应镜头”。",
+    "8. 动作从发起进入结果/受害者反应/旁人确认时，拆成动作镜头和反应镜头，中间可加入短反应镜头承接因果。",
+    "9. 场景、地点、时间或氛围切换时，插入场景空镜/建立镜头/转场镜头；characters 可以为空数组，prompt 的 [台词/旁白] 写无。",
+    "10. 反应镜头或空镜不能续写未提供剧情，只能视觉化已有切换、情绪余波、环境压力或人物反应。",
+    "11. 每个镜头的画面重点必须落在覆盖分镜单元的最后一句，即 anchorSentence。",
+    "12. narration 应保留这个镜头覆盖的原文旁白，不要改写成剧本对白。反应镜头/空镜如果没有对应旁白，narration 写无。",
+    "13. prompt 必须使用下方“镜头提示词格式”，不是普通散文提示词，不要绑定具体平台参数；除 [台词/旁白] 的引用内容外，其余全部用中文。",
+    "14. 必须参考理解档案，保持人物外貌、服装、场景和时间线一致。",
+    "15. 分集拆分由系统按镜头顺序写入 episodeNumber；你只需要在 notes 中提示适合断集的剧情节点。",
+    "16. 任何涉及旁白或角色对话的镜头，都必须在 [台词/旁白] 行使用标准引用格式。",
+    `17. 本段最多生成 ${MAX_STORYBOARD_SHOTS_PER_CHUNK} 个镜头；如果分镜单元很多，优先拆成多镜头而不是合并成长镜头。`,
     buildPromptFormatInstruction(),
     `理解档案：\n${JSON.stringify(analysis, null, 2)}`,
     `小说文本：\n${text}`
@@ -620,19 +628,20 @@ function buildPromptFormatInstruction(): string {
     "[画面细节] 主体、动作、空间、表情、构图、光线、色彩、关键道具、视觉风格；如果是主观视角，要明确是谁的视角。",
     "[摄影机补充状态] 机位高度、运动方式、稳定程度、推拉摇移、景深、畸变或遮挡。",
     "[声音设计] BGM、环境声、拟音、情绪推进、音量或节奏变化。",
-    "[台词/旁白] 旁白必须写成：旁白：“对应内容”。角色对话必须写成：角色名（情绪+发声方式）：“对应内容”。如果同一镜头同时有旁白和对话，逐条列出。没有旁白或对话时写：无。",
+    "[台词/旁白] 旁白必须写成：旁白：“对应原文内容”。角色对话必须写成：角色名（情绪+发声方式）：“对应原文内容”。双引号里的内容必须保留原文语言，不要翻译；英文原文保持英文，中文原文保持中文。如果同一镜头同时有旁白和对话，逐条列出。没有旁白或对话时写：无。",
     "[导演批注] 说明这个镜头的戏剧目的、压迫感/恐惧/爽感/悬念等观众感受，以及剪辑或同框重点。",
-    "时间段根据 durationSeconds 估算即可；不要跨镜头累计到全片时间，只写本镜头内部时间范围。"
+    "时间段表示本镜头画面时长，不是旁白阅读时长；普通镜头通常 3-6 秒，反应镜头 2-3 秒，场景空镜/建立镜头 2-4 秒。不要跨镜头累计到全片时间，只写本镜头内部时间范围。"
   ].join("\n");
 }
 
-function renderVisualStyle(style: VisualStyle): string {
-  const names: Record<VisualStyle, string> = {
+function renderVisualStyle(style: string): string {
+  const names: Record<string, string> = {
     "2D": "2D 动画/插画",
     "3D": "3D 动画/电影感渲染",
+    "3D高精度CG": "3D 高精度 CG 风格，强调精细建模、电影级材质、真实灯光和高完成度渲染",
     photoreal: "仿真人/写实影视"
   };
-  return names[style];
+  return names[style] ?? style;
 }
 
 function ensureOpenAI(): void {
@@ -725,6 +734,19 @@ function assignEpisodeNumbers(shots: StoryboardShot[], episodeCount: number): St
     ...shot,
     episodeNumber: calculateEpisodeNumber(index + 1, episodeCount, shots.length)
   }));
+}
+
+function normalizeShotTextFields(shot: RawStoryboardResult["shots"][number]): RawStoryboardResult["shots"][number] {
+  return {
+    ...shot,
+    sourceText: stripStoryboardUnitLabels(shot.sourceText),
+    anchorSentence: stripStoryboardUnitLabels(shot.anchorSentence),
+    narration: stripStoryboardUnitLabels(shot.narration)
+  };
+}
+
+function stripStoryboardUnitLabels(value: string): string {
+  return value.replace(/【分镜单元\s*\d+】/g, "").trim();
 }
 
 function looksLikeHtmlResponse(message: string): boolean {

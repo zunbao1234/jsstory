@@ -122,7 +122,7 @@ button:disabled {
 .control-band,
 .report-band {
   display: grid;
-  grid-template-columns: 1.15fr 0.75fr 0.75fr 0.42fr 0.52fr 0.42fr;
+  grid-template-columns: minmax(230px, 1fr) minmax(260px, 1.15fr) minmax(170px, 0.72fr) minmax(150px, 0.62fr) minmax(120px, 0.48fr) minmax(140px, 0.55fr) minmax(110px, 0.42fr);
   gap: 12px;
   margin: 18px 0;
   padding: 12px;
@@ -188,6 +188,14 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 7px;
+}
+
+.custom-style-field {
+  min-width: 0;
+}
+
+.custom-style-field input {
+  font-weight: 900;
 }
 
 .segmented-field > span,
@@ -303,6 +311,14 @@ button:disabled {
   color: var(--ink);
   background: var(--panel-strong);
   border: 1px solid var(--line);
+}
+
+.icon-button svg {
+  transition: transform 0.18s ease;
+}
+
+.flip {
+  transform: rotate(180deg);
 }
 
 .editor-panel > textarea {
@@ -495,13 +511,19 @@ button:disabled {
 
 .insight-panel pre {
   margin: 0;
-  min-height: 494px;
+  min-height: 260px;
+  max-height: 360px;
+  overflow-y: auto;
   white-space: pre-wrap;
   line-height: 1.7;
   color: var(--ink);
   background: #f8f3e9;
   border: 1px solid var(--line);
   padding: 14px;
+}
+
+.insight-panel pre.expanded {
+  max-height: 72vh;
 }
 
 .report-band {

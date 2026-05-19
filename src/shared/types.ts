@@ -1,11 +1,9 @@
-export type VisualStyle = "2D" | "3D" | "photoreal";
-export type ScriptStyle = "爽文" | "悬疑" | "言情" | "玄幻" | "都市" | "恐怖";
 export type LanguageMode = "zh" | "en";
 export type ReadingRateUnit = "secondsPerChar" | "secondsPerWord";
 
 export interface StorySettings {
-  visualStyle: VisualStyle;
-  scriptStyle: ScriptStyle;
+  visualStyle: string;
+  scriptStyle: string;
   language: LanguageMode;
   readingRate: number;
   readingRateUnit: ReadingRateUnit;

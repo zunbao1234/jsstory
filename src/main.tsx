@@ -8,6 +8,7 @@ import {
   Eye,
   EyeOff,
   Download,
+  FileSpreadsheet,
   FileJson,
   Film,
   Loader2,
@@ -16,11 +17,12 @@ import {
   Save,
   Settings2,
   Square,
+  ChevronDown,
   WandSparkles
 } from "lucide-react";
 import { fetchConfig, fetchModels, generateStoryboardStream, translateNovel, updateConfig } from "./api";
 import { loadLatestProject, saveProject } from "./storage";
-import { projectToJson, storyboardToCsv, summarizeAnalysis } from "./shared/export";
+import { projectToJson, sortStoryboardShots, storyboardToCsv, storyboardToExcel, summarizeAnalysis } from "./shared/export";
 import {
   estimateNovel,
   formatDuration,
@@ -31,18 +33,18 @@ import type {
   AnalysisResult,
   ConfigResponse,
   ProjectState,
-  ScriptStyle,
   StorySettings,
-  StoryboardShot,
-  VisualStyle
+  StoryboardShot
 } from "./shared/types";
 import "./styles.css";
 
-const scriptStyles: ScriptStyle[] = ["爽文", "悬疑", "言情", "玄幻", "都市", "恐怖"];
-const visualStyles: Array<{ value: VisualStyle; label: string }> = [
+const scriptStyles = ["爽文", "悬疑", "言情", "玄幻", "都市", "恐怖"];
+const visualStyles: Array<{ value: string; label: string }> = [
   { value: "2D", label: "2D" },
   { value: "3D", label: "3D" },
-  { value: "photoreal", label: "仿真人" }
+  { value: "3D高精度CG", label: "3D高精度CG" },
+  { value: "photoreal", label: "仿真人" },
+  { value: "custom", label: "自定义" }
 ];
 
 const defaultSettings: StorySettings = {
@@ -99,6 +101,9 @@ function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationProgress, setGenerationProgress] = useState<GenerationProgress | null>(null);
   const [generationAbort, setGenerationAbort] = useState<AbortController | null>(null);
+  const [customVisualStyle, setCustomVisualStyle] = useState("");
+  const [customScriptStyle, setCustomScriptStyle] = useState("");
+  const [isAnalysisExpanded, setIsAnalysisExpanded] = useState(false);
   const [restored, setRestored] = useState(false);
 
   const estimate = useMemo(
@@ -110,9 +115,10 @@ function App() {
     () => recalculateShotDurations(shots, settings.language, settings.readingRate, settings.readingRateUnit, settings.episodeCount),
     [shots, settings.language, settings.readingRate, settings.readingRateUnit, settings.episodeCount]
   );
+  const orderedShots = useMemo(() => sortStoryboardShots(recalculatedShots), [recalculatedShots]);
 
-  const totalShotDuration = recalculatedShots.reduce((sum, shot) => sum + shot.durationSeconds, 0);
-  const averageShotDuration = recalculatedShots.length > 0 ? totalShotDuration / recalculatedShots.length : 0;
+  const totalVisualDuration = orderedShots.reduce((sum, shot) => sum + shot.durationSeconds, 0);
+  const averageShotDuration = orderedShots.length > 0 ? totalVisualDuration / orderedShots.length : 0;
 
   useEffect(() => {
     initializeConfig().catch((err: Error) => setError(err.message));
@@ -152,6 +158,36 @@ function App() {
 
   function updateSettings(patch: Partial<StorySettings>) {
     setSettings((current) => ({ ...current, ...patch }));
+  }
+
+  function updateVisualStyle(value: string) {
+    if (value === "custom") {
+      const nextStyle = customVisualStyle.trim() || "自定义视觉风格";
+      setCustomVisualStyle(nextStyle);
+      updateSettings({ visualStyle: nextStyle });
+      return;
+    }
+    updateSettings({ visualStyle: value });
+  }
+
+  function updateCustomVisualStyle(value: string) {
+    setCustomVisualStyle(value);
+    updateSettings({ visualStyle: value.trim() || "自定义视觉风格" });
+  }
+
+  function updateScriptStyle(value: string) {
+    if (value === "custom") {
+      const nextStyle = customScriptStyle.trim() || "自定义剧本风格";
+      setCustomScriptStyle(nextStyle);
+      updateSettings({ scriptStyle: nextStyle });
+      return;
+    }
+    updateSettings({ scriptStyle: value });
+  }
+
+  function updateCustomScriptStyle(value: string) {
+    setCustomScriptStyle(value);
+    updateSettings({ scriptStyle: value.trim() || "自定义剧本风格" });
   }
 
   function handleNovelTextChange(value: string) {
@@ -397,11 +433,15 @@ function App() {
   }
 
   function downloadCsv() {
-    downloadFile("storyboard.csv", storyboardToCsv(recalculatedShots), "text/csv;charset=utf-8");
+    downloadFile("storyboard.csv", storyboardToCsv(orderedShots), "text/csv;charset=utf-8");
+  }
+
+  function downloadExcel() {
+    downloadFile("storyboard.xls", storyboardToExcel(orderedShots), "application/vnd.ms-excel;charset=utf-8");
   }
 
   function downloadJson() {
-    downloadFile("storyboard-project.json", projectToJson(buildProject(settings, novelText, translatedText, analysis, recalculatedShots)), "application/json");
+    downloadFile("storyboard-project.json", projectToJson(buildProject(settings, novelText, translatedText, analysis, orderedShots)), "application/json");
   }
 
   function resetSample() {
@@ -503,16 +543,40 @@ function App() {
       <section className="control-band">
         <Segmented
           label="视觉风格"
-          value={settings.visualStyle}
+          value={getVisualStyleControlValue(settings.visualStyle)}
           options={visualStyles}
-          onChange={(value) => updateSettings({ visualStyle: value as VisualStyle })}
+          onChange={updateVisualStyle}
         />
+        <label className="field custom-style-field">
+          <span>视觉描述</span>
+          <input
+            value={isCustomVisualStyle(settings.visualStyle) ? customVisualStyle || settings.visualStyle : renderVisualStyleLabel(settings.visualStyle)}
+            onChange={(event) => updateCustomVisualStyle(event.target.value)}
+            onFocus={() => {
+              if (!isCustomVisualStyle(settings.visualStyle)) {
+                updateCustomVisualStyle(renderVisualStyleLabel(settings.visualStyle));
+              }
+            }}
+            placeholder="例如：3D高精度CG、暗黑童话、赛博朋克电影感、水墨国风..."
+          />
+        </label>
         <label className="field">
           <span>剧本风格</span>
-          <select value={settings.scriptStyle} onChange={(event) => updateSettings({ scriptStyle: event.target.value as ScriptStyle })}>
+          <select value={getScriptStyleControlValue(settings.scriptStyle)} onChange={(event) => updateScriptStyle(event.target.value)}>
             {scriptStyles.map((style) => <option key={style}>{style}</option>)}
+            <option value="custom">自定义</option>
           </select>
         </label>
+        {isCustomScriptStyle(settings.scriptStyle) && (
+          <label className="field custom-style-field">
+            <span>自定义剧本</span>
+            <input
+              value={customScriptStyle || settings.scriptStyle}
+              onChange={(event) => updateCustomScriptStyle(event.target.value)}
+              placeholder="例如：克苏鲁悬疑、热血升级、黑色幽默..."
+            />
+          </label>
+        )}
         <Segmented
           label="语言"
           value={settings.language}
@@ -637,21 +701,31 @@ function App() {
               <p className="eyebrow">Understanding Skill</p>
               <h2>理解档案</h2>
             </div>
-            <Save size={18} />
+            <button
+              className="icon-button"
+              type="button"
+              onClick={() => setIsAnalysisExpanded((value) => !value)}
+              title={isAnalysisExpanded ? "收起理解档案" : "展开理解档案"}
+            >
+              {isAnalysisExpanded ? <ChevronDown className="flip" size={18} /> : <ChevronDown size={18} />}
+            </button>
           </div>
-          <pre>{summarizeAnalysis(analysis)}</pre>
+          <pre className={isAnalysisExpanded ? "expanded" : ""}>{summarizeAnalysis(analysis)}</pre>
         </aside>
       </section>
 
       <section className="report-band">
-        <Metric label="镜头数" value={recalculatedShots.length.toString()} />
+        <Metric label="镜头数" value={orderedShots.length.toString()} />
         <Metric label="目标分集" value={`${settings.episodeCount}集`} />
-        <Metric label="镜头总时长" value={formatDuration(totalShotDuration)} />
+        <Metric label="画面总时长" value={formatDuration(totalVisualDuration)} />
         <Metric label="平均镜头" value={`${averageShotDuration.toFixed(1)}秒`} />
         <Metric label="拆句预览" value={`${splitSentences(novelText, settings.language).slice(0, 1)[0]?.slice(0, 18) ?? "无"}...`} />
         <div className="export-actions">
-          <button onClick={downloadCsv} disabled={recalculatedShots.length === 0}>
+          <button onClick={downloadCsv} disabled={orderedShots.length === 0}>
             <Download size={17} /> CSV
+          </button>
+          <button onClick={downloadExcel} disabled={orderedShots.length === 0}>
+            <FileSpreadsheet size={17} /> Excel
           </button>
           <button onClick={downloadJson}>
             <FileJson size={17} /> JSON
@@ -659,7 +733,7 @@ function App() {
         </div>
       </section>
 
-      <StoryboardTable shots={recalculatedShots} onChange={updateShot} />
+      <StoryboardTable shots={orderedShots} onChange={updateShot} />
     </main>
   );
 }
@@ -676,7 +750,7 @@ function StoryboardTable({
       <section className="empty">
         <Film size={30} />
         <h2>还没有分镜</h2>
-        <p>输入小说后点击生成。表格会在这里显示旁白、落点句、画面描述、提示词和时长。</p>
+        <p>输入小说后点击生成。表格会在这里显示旁白、落点句、画面描述、提示词和镜头秒数。</p>
       </section>
     );
   }
@@ -703,7 +777,7 @@ function StoryboardTable({
               <th>角色</th>
               <th>场景</th>
               <th>情绪</th>
-              <th>秒</th>
+              <th>镜头秒数</th>
             </tr>
           </thead>
           <tbody>
@@ -732,7 +806,7 @@ function StoryboardTable({
                             第 {shot.episodeNumber} 集 · 镜头 {shot.index} 提示词
                           </h3>
                         </div>
-                        <span>{shot.durationSeconds.toFixed(1)} 秒</span>
+                        <span>镜头 {shot.durationSeconds.toFixed(1)} 秒</span>
                       </div>
                       <textarea
                         className="prompt-textarea"
@@ -817,6 +891,26 @@ function getProgressPercent(progress: GenerationProgress): number {
   if (progress.phase === "done") return 100;
   const total = Math.max(1, progress.chunkTotal);
   return Math.min(100, Math.round((progress.completedChunks / total) * 100));
+}
+
+function getVisualStyleControlValue(style: string): string {
+  return visualStyles.some((option) => option.value === style) ? style : "custom";
+}
+
+function isCustomVisualStyle(style: string): boolean {
+  return getVisualStyleControlValue(style) === "custom";
+}
+
+function renderVisualStyleLabel(style: string): string {
+  return visualStyles.find((option) => option.value === style)?.label ?? style;
+}
+
+function getScriptStyleControlValue(style: string): string {
+  return scriptStyles.includes(style) ? style : "custom";
+}
+
+function isCustomScriptStyle(style: string): boolean {
+  return getScriptStyleControlValue(style) === "custom";
 }
 
 function renderApiKeySource(config: ConfigResponse | null): string {
