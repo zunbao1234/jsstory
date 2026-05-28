@@ -41,6 +41,7 @@ export interface StoryboardShot {
   sourceText: string;
   anchorSentence: string;
   narration: string;
+  dialogueLines: DialogueLine[];
   imageDescription: string;
   shotType: string;
   characters: string[];
@@ -48,6 +49,12 @@ export interface StoryboardShot {
   emotion: string;
   prompt: string;
   durationSeconds: number;
+}
+
+export interface DialogueLine {
+  speaker: string;
+  delivery: string;
+  text: string;
 }
 
 export interface StoryboardResult {
@@ -58,12 +65,16 @@ export interface StoryboardResult {
 export interface ProjectState {
   id: string;
   title: string;
+  sourceFilename?: string;
   novelText: string;
   translatedText?: string;
   settings: StorySettings;
   analysis: AnalysisResult | null;
   shots: StoryboardShot[];
   updatedAt: number;
+  createdAt?: number;
+  status?: "draft" | "generating" | "completed" | "failed";
+  lastError?: string;
 }
 
 export interface ConfigResponse {
@@ -88,12 +99,15 @@ export interface TranslationResponse {
 }
 
 export type GenerationStreamEvent =
+  | { type: "heartbeat"; phase: "connected" | "analysis" | "analysis_merge" | "storyboard"; elapsedSeconds: number }
   | { type: "started"; chunkTotal: number }
   | { type: "analysis_started"; chunkTotal: number }
   | { type: "analysis_chunk"; chunkIndex: number; chunkTotal: number; completedChunks: number }
   | { type: "analysis_merge"; completedBatches: number; totalBatches: number }
+  | { type: "analysis_merge_progress"; activeBatch: number; totalBatches: number; completedBatches: number; elapsedSeconds: number }
   | { type: "analysis_completed"; analysis: AnalysisResult }
-  | { type: "storyboard_started"; chunkTotal: number }
+  | { type: "storyboard_started"; chunkTotal: number; startChunkIndex?: number; completedChunks?: number; completedShots?: number }
+  | { type: "storyboard_progress"; chunkIndex: number; chunkTotal: number; finishedChunks: number; displayedChunks: number }
   | {
       type: "storyboard_chunk";
       chunkIndex: number;

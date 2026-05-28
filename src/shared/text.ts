@@ -1,7 +1,6 @@
 import type { Estimate, LanguageMode, ReadingRateUnit, StoryboardShot } from "./types";
 
 const CHINESE_SENTENCE_RE = /[^。！？!?；;]+[。！？!?；;]?/g;
-const ENGLISH_SENTENCE_RE = /[^.!?]+[.!?]?/g;
 const CHUNK_SIZE = 2200;
 const STORYBOARD_CHUNK_UNIT_LIMIT = 8;
 const STORYBOARD_CHUNK_SIZE = 1100;
@@ -10,6 +9,7 @@ const STORYBOARD_ZH_UNITS_PER_SECOND = 6;
 const STORYBOARD_EN_WORDS_PER_SECOND = 2.4;
 const MAX_ZH_STORYBOARD_UNITS = 48;
 const MAX_EN_STORYBOARD_UNITS = 36;
+const MIN_EN_TAIL_WORDS = 4;
 const BRIDGE_SHOT_SECONDS = 2;
 const REACTION_SHOT_SECONDS = 2.5;
 const ESTABLISHING_SHOT_SECONDS = 3;
@@ -27,11 +27,76 @@ export function splitSentences(text: string, language: LanguageMode): string[] {
 
   const blocks = clean.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
   const sentences = blocks.flatMap((block) => {
-    const matches = block.match(language === "zh" ? CHINESE_SENTENCE_RE : ENGLISH_SENTENCE_RE);
+    const matches = language === "zh" ? block.match(CHINESE_SENTENCE_RE) : splitEnglishSentences(block);
     return matches?.map((item) => item.trim()).filter(Boolean) ?? [block];
   });
 
   return sentences.filter((sentence) => sentence.length > 0);
+}
+
+function splitEnglishSentences(text: string): string[] {
+  const sentences: string[] = [];
+  let current = "";
+  let quote: "\"" | "'" | "“" | "‘" | null = null;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    current += char;
+
+    if (isEnglishQuote(char, quote)) {
+      quote = getNextEnglishQuoteState(char, quote);
+      continue;
+    }
+
+    if (quote) continue;
+    if (!/[.!?]/.test(char)) continue;
+
+    let lookahead = index + 1;
+    while (lookahead < text.length && /["'”’]/.test(text[lookahead])) {
+      current += text[lookahead];
+      lookahead += 1;
+    }
+    index = lookahead - 1;
+
+    if (shouldKeepAttributionWithQuote(current, text.slice(lookahead))) continue;
+
+    sentences.push(current.trim());
+    current = "";
+    while (index + 1 < text.length && /\s/.test(text[index + 1])) {
+      index += 1;
+    }
+  }
+
+  if (current.trim()) sentences.push(current.trim());
+  return sentences;
+}
+
+function isEnglishQuote(char: string, activeQuote: "\"" | "'" | "“" | "‘" | null): boolean {
+  if (char === "\"" || char === "“" || char === "”" || char === "‘" || char === "’") return true;
+  if (char !== "'") return false;
+  if (activeQuote === "'") return true;
+  return false;
+}
+
+function getNextEnglishQuoteState(
+  char: string,
+  activeQuote: "\"" | "'" | "“" | "‘" | null
+): "\"" | "'" | "“" | "‘" | null {
+  if (activeQuote === "“" && char === "”") return null;
+  if (activeQuote === "‘" && char === "’") return null;
+  if (activeQuote === "\"" && char === "\"") return null;
+  if (activeQuote === "'" && char === "'") return null;
+  if (activeQuote) return activeQuote;
+  if (char === "“") return "“";
+  if (char === "‘") return "‘";
+  if (char === "\"") return "\"";
+  if (char === "'") return "'";
+  return null;
+}
+
+function shouldKeepAttributionWithQuote(current: string, rest: string): boolean {
+  if (!/["”’]\s*$/.test(current)) return false;
+  return /^\s*(?:he|she|they|i|we|you|[A-Z][a-z]+)\s+(?:said|asked|whispered|shouted|murmured|replied|cried|sobbed|snapped|answered|continued|added)\b/i.test(rest);
 }
 
 export function countReadingUnits(text: string, language: LanguageMode, unit: ReadingRateUnit): number {
@@ -93,6 +158,7 @@ export function recalculateShotDurations(
     ...shot,
     episodeNumber: calculateEpisodeNumber(index + 1, episodeCount, shots.length),
     index: shot.index ?? index + 1,
+    dialogueLines: shot.dialogueLines ?? [],
     durationSeconds: calculateShotDurationSeconds(shot, language)
   }));
 }
@@ -224,7 +290,13 @@ function buildStoryboardUnits(
   let current = "";
 
   for (const sentence of sentences) {
+    if (current && shouldPreserveSentenceBoundary(current, sentence, language)) {
+      units.push(current.trim());
+      current = "";
+    }
+
     const clauses = splitSentenceForVideo(sentence, language, maxUnits, unit);
+    const preserveVideoPartBoundaries = shouldPreserveVideoPartBoundaries(sentence, clauses, language, maxUnits, unit);
     for (const clause of clauses) {
       const next = joinTextUnit(current, clause, language);
       const nextUnits = countReadingUnits(next, language, unit);
@@ -234,11 +306,41 @@ function buildStoryboardUnits(
       } else {
         current = next;
       }
+
+      if (preserveVideoPartBoundaries && current) {
+        units.push(current.trim());
+        current = "";
+      }
+    }
+
+    if (current && containsDirectSpeech(sentence)) {
+      units.push(current.trim());
+      current = "";
     }
   }
 
   if (current.trim()) units.push(current.trim());
   return units.map((unitText, index) => ({ index: index + 1, text: unitText }));
+}
+
+function shouldPreserveVideoPartBoundaries(
+  sentence: string,
+  parts: string[],
+  language: LanguageMode,
+  maxUnits: number,
+  unit: ReadingRateUnit
+): boolean {
+  if (parts.length <= 1) return false;
+  return shouldSplitNearLimitEnglishClause(countReadingUnits(sentence, language, unit), parts, language, maxUnits);
+}
+
+function shouldPreserveSentenceBoundary(current: string, nextSentence: string, language: LanguageMode): boolean {
+  if (language !== "en") return false;
+  return containsDirectSpeech(current) || containsDirectSpeech(nextSentence);
+}
+
+function containsDirectSpeech(text: string): boolean {
+  return /["“”‘’]/.test(text);
 }
 
 function joinTextUnit(current: string, next: string, language: LanguageMode): string {
@@ -253,18 +355,85 @@ function splitSentenceForVideo(
   maxUnits: number,
   unit: ReadingRateUnit
 ): string[] {
-  if (countReadingUnits(sentence, language, unit) <= maxUnits) return [sentence];
+  const directSpeechParts = splitDirectSpeechForVideo(sentence, language, unit, maxUnits);
+  if (directSpeechParts) return directSpeechParts;
+  const sentenceUnits = countReadingUnits(sentence, language, unit);
 
-  const clauses = sentence
-    .split(language === "zh" ? /(?<=[，,、：:])/ : /(?<=[,;:])\s+/)
+  const clauses = splitSentenceClauses(sentence, language)
     .map((item) => item.trim())
     .filter(Boolean);
+  if (sentenceUnits <= maxUnits && !shouldSplitNearLimitEnglishClause(sentenceUnits, clauses, language, maxUnits)) {
+    return [sentence];
+  }
   const candidates = clauses.length > 1 ? clauses : splitLongTextByReadingUnits(sentence, language, unit, maxUnits);
 
   return candidates.flatMap((candidate) => {
     if (countReadingUnits(candidate, language, unit) <= maxUnits) return [candidate];
     return splitLongTextByReadingUnits(candidate, language, unit, maxUnits);
   });
+}
+
+function splitSentenceClauses(sentence: string, language: LanguageMode): string[] {
+  if (language === "zh") return sentence.split(/(?<=[，,、：:])/);
+  return splitEnglishClausesOutsideQuotes(sentence);
+}
+
+function splitEnglishClausesOutsideQuotes(sentence: string): string[] {
+  const clauses: string[] = [];
+  let current = "";
+  let quote: "\"" | "'" | "“" | "‘" | null = null;
+
+  for (let index = 0; index < sentence.length; index += 1) {
+    const char = sentence[index];
+    current += char;
+
+    if (isEnglishQuote(char, quote)) {
+      quote = getNextEnglishQuoteState(char, quote);
+      continue;
+    }
+
+    if (quote || !/[,;:]/.test(char)) continue;
+    while (index + 1 < sentence.length && /\s/.test(sentence[index + 1])) {
+      index += 1;
+    }
+    clauses.push(current.trim());
+    current = "";
+  }
+
+  if (current.trim()) clauses.push(current.trim());
+  return clauses.length > 0 ? clauses : [sentence];
+}
+
+function shouldSplitNearLimitEnglishClause(
+  sentenceUnits: number,
+  clauses: string[],
+  language: LanguageMode,
+  maxUnits: number
+): boolean {
+  return language === "en" && clauses.length > 1 && sentenceUnits >= Math.ceil(maxUnits * 0.7);
+}
+
+function splitDirectSpeechForVideo(
+  text: string,
+  language: LanguageMode,
+  unit: ReadingRateUnit,
+  maxUnits: number
+): string[] | null {
+  if (language !== "en") return null;
+  const trimmed = text.trim();
+  const match = trimmed.match(/^(['"])(.+)\1(\s+(?:he|she|they|i|we|you|[A-Z][a-z]+)\s+(?:said|asked|whispered|shouted|murmured|replied|cried|sobbed|snapped|answered|continued|added)\.)?$/is);
+  if (!match) return null;
+
+  const quote = match[1];
+  const quoteText = match[2].trim();
+  const attribution = match[3]?.trim() ?? "";
+  const totalUnits = countReadingUnits(trimmed, language, unit);
+  if (totalUnits <= maxUnits) return [trimmed];
+
+  const safeMaxUnits = Math.max(MIN_EN_TAIL_WORDS, maxUnits - countReadingUnits(attribution, language, unit));
+  const parts = splitLongTextByReadingUnits(quoteText, language, unit, safeMaxUnits)
+    .map((part) => `${quote}${part}${quote}${attribution ? ` ${attribution}` : ""}`);
+  return parts.length > 0 ? parts : [trimmed];
 }
 
 function splitLongTextByReadingUnits(
@@ -279,7 +448,7 @@ function splitLongTextByReadingUnits(
     for (let index = 0; index < words.length; index += maxUnits) {
       parts.push(words.slice(index, index + maxUnits).join(" "));
     }
-    return parts.filter(Boolean);
+    return rebalanceShortEnglishTail(parts.filter(Boolean), maxUnits);
   }
 
   const parts: string[] = [];
@@ -287,6 +456,31 @@ function splitLongTextByReadingUnits(
     parts.push(text.slice(index, index + maxUnits));
   }
   return parts.map((item) => item.trim()).filter(Boolean);
+}
+
+function rebalanceShortEnglishTail(parts: string[], maxUnits: number): string[] {
+  if (parts.length < 2) return parts;
+
+  const last = parts[parts.length - 1];
+  const lastWordCount = countReadingUnits(last, "en", "secondsPerWord");
+  if (lastWordCount === 0 || lastWordCount >= MIN_EN_TAIL_WORDS) return parts;
+
+  const previous = parts[parts.length - 2];
+  const previousWords = previous.match(/\S+/g) ?? [];
+  const lastWords = last.match(/\S+/g) ?? [];
+  const overflowBudget = Math.max(MIN_EN_TAIL_WORDS, Math.ceil(maxUnits * 0.2));
+
+  if (previousWords.length + lastWords.length <= maxUnits + overflowBudget) {
+    return [...parts.slice(0, -2), `${previous} ${last}`.trim()];
+  }
+
+  const moveCount = Math.min(MIN_EN_TAIL_WORDS - lastWordCount, Math.max(0, previousWords.length - 1));
+  if (moveCount <= 0) return parts;
+
+  const movedWords = previousWords.slice(-moveCount);
+  const nextPrevious = previousWords.slice(0, -moveCount).join(" ");
+  const nextLast = [...movedWords, ...lastWords].join(" ");
+  return [...parts.slice(0, -2), nextPrevious, nextLast].filter(Boolean);
 }
 
 function getMaxShotReadingUnits(language: LanguageMode): number {
@@ -303,7 +497,7 @@ function isBridgeShot(shot: Pick<StoryboardShot, "shotType" | "imageDescription"
 
 function isReactionShot(shot: Pick<StoryboardShot, "shotType" | "imageDescription" | "prompt">): boolean {
   const text = `${shot.shotType} ${shot.imageDescription} ${shot.prompt}`;
-  return /反应镜头|第三方反应|旁观者|受害者反应|关系视线|reaction|cutaway/i.test(text);
+  return /反应镜头|第三方反应|旁观者|当事人反应|关系视线|reaction|cutaway/i.test(text);
 }
 
 function isEstablishingShot(shot: Pick<StoryboardShot, "shotType" | "imageDescription" | "prompt">): boolean {

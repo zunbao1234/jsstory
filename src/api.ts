@@ -55,12 +55,39 @@ export async function generateStoryboardStream(
   onEvent: (event: GenerationStreamEvent) => void,
   signal?: AbortSignal
 ): Promise<void> {
-  const response = await fetch("/api/generate/stream", {
+  await readGenerationStream("/api/generate/stream", { text, settings }, onEvent, signal);
+}
+
+export async function resumeStoryboardStream(
+  text: string,
+  settings: StorySettings,
+  analysis: AnalysisResult,
+  existingShots: StoryboardResult["shots"],
+  startChunkIndex: number,
+  onEvent: (event: GenerationStreamEvent) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  await readGenerationStream("/api/generate/storyboard/resume", {
+    text,
+    settings,
+    analysis,
+    existingShots,
+    startChunkIndex
+  }, onEvent, signal);
+}
+
+async function readGenerationStream(
+  url: string,
+  body: unknown,
+  onEvent: (event: GenerationStreamEvent) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  const response = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
     },
-    body: JSON.stringify({ text, settings }),
+    body: JSON.stringify(body),
     signal
   });
 

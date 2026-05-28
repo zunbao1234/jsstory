@@ -9,6 +9,7 @@
     "dev:server": "tsx watch server/index.ts",
     "build": "tsc && vite build",
     "test": "tsx server/error-handling.test.ts",
+    "test:mock-stream": "node scripts/mock-stream-smoke.mjs",
     "preview": "vite preview",
     "start": "node dist-server/index.js"
   },
