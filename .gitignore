@@ -4,5 +4,7 @@ dist-server
 .env
 .DS_Store
 *.log
+.tmp/
+*.zip
 .agents
 skills-lock.json

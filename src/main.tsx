@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   AlertCircle,
+  Activity,
   CheckCircle2,
   Languages,
   Clapperboard,
@@ -23,11 +24,15 @@ import {
   ChevronDown,
   WandSparkles
 } from "lucide-react";
-import { fetchConfig, fetchModels, generateStoryboardStream, resumeStoryboardStream, translateNovel, updateConfig } from "./api";
-import { deleteProject, loadLatestProject, loadProjects, saveProject } from "./storage";
+import { checkModelConnection, fetchConfig, fetchModels, generateStoryboardStream, regenerateStoryboardShot, resumeStoryboardStream, translateNovel, updateConfig } from "./api";
+import { deleteProject, loadProjects, saveProject } from "./storage";
 import { numberStoryboardShots, projectToJson, sortStoryboardShots, storyboardToCsv, storyboardToExcel, summarizeAnalysis } from "./shared/export";
 import { buildDownloadFilename, deriveProjectTitleFromFilename } from "./shared/files";
+import { detectLanguageMode, shouldAutoTranslate } from "./shared/language";
+import { clearGeneratingStoryboardShots, countCompletedStoryboardShots, createStoryboardPlaceholders, failStoryboardChunkShots, getGenerationPreparationStatus, getGenerationStartBlockReason, markStoryboardChunkGenerating, replaceStoryboardChunkShots, replaceStoryboardShotWithResults } from "./shared/generation";
+import { DEFAULT_MODEL, selectPreferredModel } from "./shared/models";
 import {
+  buildStoryboardPlan,
   estimateNovel,
   formatDuration,
   recalculateShotDurations,
@@ -35,12 +40,14 @@ import {
 } from "./shared/text";
 import type {
   AnalysisResult,
+  ApiConnectionStatus,
   ConfigResponse,
   ProjectState,
   StorySettings,
   StoryboardShot
 } from "./shared/types";
 import "./styles.css";
+import { createDemoProject } from "./demoProject";
 
 const scriptStyles = ["爽文", "悬疑", "言情", "玄幻", "都市", "惊悚"];
 const visualStyles: Array<{ value: string; label: string }> = [
@@ -65,7 +72,6 @@ const sampleText =
 
 const API_CONFIG_STORAGE_KEY = "jsstory-api-config";
 
-type ApiConnectionStatus = "unknown" | "checking" | "connected" | "failed";
 type GenerationPhase = "analysis" | "analysis_merge" | "storyboard" | "done" | "failed";
 
 interface GenerationProgress {
@@ -109,7 +115,9 @@ function App() {
   const [showApiKey, setShowApiKey] = useState(false);
   const [isSavingConfig, setIsSavingConfig] = useState(false);
   const [isLoadingModels, setIsLoadingModels] = useState(false);
+  const [isCheckingModel, setIsCheckingModel] = useState(false);
   const [isTranslating, setIsTranslating] = useState(false);
+  const [translationError, setTranslationError] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationProgress, setGenerationProgress] = useState<GenerationProgress | null>(null);
   const [generationAbort, setGenerationAbort] = useState<AbortController | null>(null);
@@ -118,6 +126,7 @@ function App() {
   const [customVisualStyle, setCustomVisualStyle] = useState("");
   const [customScriptStyle, setCustomScriptStyle] = useState("");
   const [isAnalysisExpanded, setIsAnalysisExpanded] = useState(false);
+  const [regeneratingShotId, setRegeneratingShotId] = useState<string | null>(null);
   const [restored, setRestored] = useState(false);
   const [activeProjectId, setActiveProjectId] = useState("local-main");
   const [activeSourceFilename, setActiveSourceFilename] = useState<string | undefined>();
@@ -127,6 +136,7 @@ function App() {
   const generationStartedAtRef = useRef(0);
   const lastGenerationEventAtRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const translationRequestIdRef = useRef(0);
 
   const estimate = useMemo(
     () => estimateNovel(novelText, settings.language, settings.readingRate, settings.readingRateUnit),
@@ -146,12 +156,12 @@ function App() {
   useEffect(() => {
     initializeConfig().catch((err: Error) => setError(err.message));
 
-    loadLatestProject().then((project) => {
-      if (!project) return;
-      applyProject(project);
-      setRestored(true);
-    });
-    refreshProjectHistory().catch((err) => console.warn("读取历史记录失败", err));
+    const demoProject = createDemoProject();
+    applyProject(demoProject);
+    setRestored(false);
+    saveProject(demoProject)
+      .then(() => refreshProjectHistory())
+      .catch((err) => console.warn("保存演示项目失败", err));
   }, []);
 
   useEffect(() => {
@@ -174,13 +184,13 @@ function App() {
       return;
     }
     const cleanText = novelText.trim();
-    if (cleanText.length < 20 || !config?.hasApiKey) return;
+    if (!shouldAutoTranslate(cleanText, settings.language)) return;
 
     const timer = window.setTimeout(() => {
       void runTranslation(cleanText);
     }, 900);
     return () => window.clearTimeout(timer);
-  }, [novelText, settings.language, config?.hasApiKey]);
+  }, [novelText, settings.language]);
 
   useEffect(() => {
     if (!isGenerating) {
@@ -203,8 +213,7 @@ function App() {
 
   function updateVisualStyle(value: string) {
     if (value === "custom") {
-      const nextStyle = customVisualStyle.trim() || "自定义视觉风格";
-      setCustomVisualStyle(nextStyle);
+      const nextStyle = customVisualStyle.trim() || (isCustomVisualStyle(settings.visualStyle) ? settings.visualStyle : "自定义视觉风格");
       updateSettings({ visualStyle: nextStyle });
       return;
     }
@@ -235,6 +244,7 @@ function App() {
     setActiveProjectId(project.id);
     setActiveSourceFilename(project.sourceFilename);
     setSettings({ ...defaultSettings, ...project.settings });
+    setCustomVisualStyle(isCustomVisualStyle(project.settings.visualStyle) ? project.settings.visualStyle : "");
     setNovelText(project.novelText);
     setTranslatedText(project.translatedText ?? "");
     setAnalysis(project.analysis);
@@ -311,6 +321,10 @@ function App() {
 
   function handleNovelTextChange(value: string) {
     setNovelText(value);
+    translationRequestIdRef.current += 1;
+    setTranslatedText("");
+    setTranslationError("");
+    setIsTranslating(false);
     setAnalysis(null);
     setShots([]);
     shotsRef.current = [];
@@ -401,14 +415,13 @@ function App() {
       setConnectionMessage("正在读取模型列表");
       const result = await fetchModels();
       setModelOptions(result.models);
-      if (result.models.length > 0 && !result.models.includes(currentModel)) {
-        setModelInput(result.models[0]);
-        setUseCustomModel(false);
-      } else if (result.models.length > 0) {
-        setUseCustomModel(false);
-      }
-      setConnectionStatus("connected");
-      setConnectionMessage(result.models.length > 0 ? `已连通，读取到 ${result.models.length} 个模型` : "已连通，但未返回模型列表");
+      const selection = selectPreferredModel(result.models, currentModel);
+      setModelInput(selection.model);
+      setUseCustomModel(selection.useCustomModel);
+      setConnectionStatus("unknown");
+      setConnectionMessage(result.models.length > 0
+        ? `模型列表接口可用，读取到 ${result.models.length} 个模型；已选择 ${selection.model}，请测试生成能力`
+        : "模型列表接口可用，但未返回模型列表；尚未测试所选模型生成");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setConnectionStatus("failed");
@@ -418,34 +431,75 @@ function App() {
     }
   }
 
-  async function runTranslation(text: string) {
+  async function testSelectedModel() {
     setError("");
+    setConfigMessage("");
+    if (!modelInput.trim()) {
+      setError("请先填写模型名称。");
+      return;
+    }
+
+    try {
+      setIsCheckingModel(true);
+      setConnectionStatus("checking");
+      setConnectionMessage("正在向当前模型发送轻量测试请求");
+      const nextConfig = await updateConfig({
+        model: modelInput.trim(),
+        apiKey: apiKeyInput.trim() || undefined,
+        baseURL: baseUrlInput.trim()
+      });
+      setConfig(nextConfig);
+      const savedApiKey = apiKeyInput.trim() || readSavedApiConfig()?.apiKey || "";
+      if (savedApiKey) {
+        saveApiConfig({ model: nextConfig.model, apiKey: savedApiKey, baseURL: nextConfig.baseURL });
+        setApiKeyInput(savedApiKey);
+      }
+      const result = await checkModelConnection(nextConfig.model);
+      setConnectionStatus("connected");
+      setConnectionMessage(`模型生成测试成功：${result.model} · ${result.api === "responses" ? "Responses" : "Chat Completions"} · ${(result.elapsedMs / 1000).toFixed(1)} 秒`);
+      setConfigMessage("当前配置已应用，模型可以正常响应轻量生成请求。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setConnectionStatus("failed");
+      setConnectionMessage("模型生成测试失败");
+    } finally {
+      setIsCheckingModel(false);
+    }
+  }
+
+  async function runTranslation(text: string): Promise<string | null> {
+    const requestId = ++translationRequestIdRef.current;
+    setTranslationError("");
+    if (!text.trim()) {
+      setTranslatedText("");
+      return null;
+    }
     try {
       setIsTranslating(true);
       const result = await translateNovel(text);
-      setTranslatedText(result.translatedText);
+      if (requestId === translationRequestIdRef.current) setTranslatedText(result.translatedText);
+      return result.translatedText;
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (requestId === translationRequestIdRef.current) {
+        setTranslationError(err instanceof Error ? err.message : String(err));
+      }
+      return null;
     } finally {
-      setIsTranslating(false);
+      if (requestId === translationRequestIdRef.current) setIsTranslating(false);
     }
   }
 
   async function runGeneration() {
     setError("");
     setConfigMessage("");
-    if (novelText.trim().length < 20) {
-      setError("请至少输入 20 个字符的小说正文。");
-      return;
-    }
-    if (!config?.hasApiKey) {
-      setError("请先配置 API Key 并应用配置。");
-      setStatus("等待 API 配置");
-      return;
-    }
-    if (connectionStatus !== "connected") {
-      setError("API 尚未连通。请先点击“应用配置”或“读取模型”，确认模型列表读取成功后再开始。");
-      setStatus("等待 API 连通");
+    const blockReason = getGenerationStartBlockReason({
+      textLength: novelText.trim().length,
+      hasApiKey: Boolean(config?.hasApiKey),
+      connectionStatus
+    });
+    if (blockReason) {
+      setError(blockReason);
+      setStatus(connectionStatus === "checking" ? "正在检查 API 连接" : "等待 API 配置或连通");
       return;
     }
 
@@ -453,18 +507,26 @@ function App() {
       setIsGenerating(true);
       generationStartedAtRef.current = Date.now();
       lastGenerationEventAtRef.current = Date.now();
+      const storyboardPlan = buildStoryboardPlan(novelText, settings.language, settings.readingRate, settings.readingRateUnit);
+      const initialShots = createStoryboardPlaceholders(storyboardPlan, settings);
       setAnalysis(null);
-      setShots([]);
-      shotsRef.current = [];
-      generationProgressRef.current = null;
+      replaceShots(initialShots);
       setResumeState(null);
+      setStatus(getGenerationPreparationStatus(settings.language, !translatedText.trim()));
+      if (settings.language === "en" && !translatedText.trim()) {
+        const translation = await runTranslation(novelText.trim());
+        if (!translation) {
+          setStatus("机器翻译暂时不可用，将继续使用英文原文创作");
+        }
+      }
+      generationProgressRef.current = null;
       setProgress({
         phase: "analysis",
         chunkTotal: estimate.chunkCount,
         completedChunks: 0,
         completedShots: 0
       });
-      setStatus(`开始创作：预计 ${estimate.chunkCount} 段，正在理解小说`);
+      setStatus(`已拆分 ${initialShots.length} 个分镜单元，正在理解小说`);
       const controller = new AbortController();
       setGenerationAbort(controller);
       await generateStoryboardStream(
@@ -473,7 +535,9 @@ function App() {
         (event) => {
           lastGenerationEventAtRef.current = Date.now();
           if (event.type === "heartbeat") {
-            setStatus(`创作连接正常：已运行 ${event.elapsedSeconds} 秒，等待模型返回阶段结果`);
+            setStatus(event.phase === "storyboard"
+              ? `分镜连接正常：已运行 ${event.elapsedSeconds} 秒，正在等待模型响应`
+              : `创作连接正常：已运行 ${event.elapsedSeconds} 秒，等待模型返回阶段结果`);
           }
           if (event.type === "started") {
             setProgress({
@@ -518,8 +582,24 @@ function App() {
             }));
             setStatus(`分镜阶段：${event.completedChunks ?? 0}/${event.chunkTotal} 段`);
           }
+          if (event.type === "storyboard_chunk_started") {
+            setShots((current) => {
+              const next = markStoryboardChunkGenerating(current, event.chunkIndex);
+              shotsRef.current = next;
+              return next;
+            });
+            setStatus(`正在撰写第 ${event.chunkIndex + 1}/${event.chunkTotal} 段分镜提示词`);
+          }
+          if (event.type === "storyboard_retrying") {
+            const retryCause = /超时|timed out|timeout/i.test(event.reason) ? "响应超时" : "请求未完成";
+            setStatus(`第 ${event.chunkIndex + 1}/${event.chunkTotal} 段${retryCause}，正在拆分重试第 ${event.partIndex}/${event.partTotal} 个小段`);
+          }
           if (event.type === "storyboard_chunk") {
-            appendShots(event.shots);
+            setShots((current) => {
+              const next = replaceStoryboardChunkShots(current, event.chunkIndex, event.shots);
+              shotsRef.current = next;
+              return next;
+            });
             setProgress({
               phase: "storyboard",
               chunkTotal: event.chunkTotal,
@@ -527,6 +607,17 @@ function App() {
               completedShots: event.completedShots
             });
             setStatus(`分镜阶段：${event.completedChunks}/${event.chunkTotal} 段，已生成 ${event.completedShots} 个镜头`);
+          }
+          if (event.type === "storyboard_chunk_failed") {
+            const failedShots = failStoryboardChunkShots(shotsRef.current, event.chunkIndex, event.error);
+            replaceShots(failedShots);
+            setProgress({
+              phase: "storyboard",
+              chunkTotal: event.chunkTotal,
+              completedChunks: event.completedChunks,
+              completedShots: countCompletedStoryboardShots(failedShots)
+            });
+            setStatus(`第 ${event.chunkIndex + 1}/${event.chunkTotal} 段失败，已跳过并继续后续分镜`);
           }
           if (event.type === "storyboard_progress") {
             updateProgress((current) => current ? {
@@ -539,8 +630,11 @@ function App() {
           if (event.type === "done") {
             replaceShots(event.shots);
             setResumeState(null);
-            updateProgress((current) => current ? { ...current, phase: "done", completedShots: event.totalShots } : current);
-            setStatus(`完成：生成 ${event.totalShots} 个镜头`);
+            const failedCount = event.shots.filter((shot) => shot.generationStatus === "failed").length;
+            const completedCount = event.shots.filter((shot) => shot.generationStatus === "completed").length;
+            updateProgress((current) => current ? { ...current, phase: "done", completedShots: completedCount } : current);
+            setError(failedCount > 0 ? `${failedCount} 个分镜单元生成失败，已跳过并完成其他单元；可在对应分镜上单独重试。` : "");
+            setStatus(failedCount > 0 ? `流程完成：${completedCount} 个镜头已生成，${failedCount} 个单元待处理` : `完成：生成 ${completedCount} 个镜头`);
             void saveCurrentProjectSnapshot({ shots: event.shots, status: "completed" });
           }
         },
@@ -548,7 +642,11 @@ function App() {
       );
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
-        setStatus("已取消生成，已保留当前结果");
+        const pausedShots = clearGeneratingStoryboardShots(shotsRef.current);
+        replaceShots(pausedShots);
+        const nextResumeState = buildResumeState("手动暂停", generationProgressRef.current, pausedShots);
+        setResumeState(nextResumeState);
+        setStatus(nextResumeState?.phase === "storyboard" ? "已暂停分镜生成，未完成单元已保留" : "已暂停生成，当前分镜草稿已保留");
       } else {
         const message = err instanceof Error ? err.message : String(err);
         const nextResumeState = buildResumeState(message, generationProgressRef.current, shotsRef.current);
@@ -569,6 +667,7 @@ function App() {
   }
 
   function cancelGeneration() {
+    setStatus("正在暂停并保存当前进度...");
     generationAbort?.abort();
   }
 
@@ -580,14 +679,6 @@ function App() {
   function updateProgress(updater: (current: GenerationProgress | null) => GenerationProgress | null) {
     const nextProgress = updater(generationProgressRef.current);
     setProgress(nextProgress);
-  }
-
-  function appendShots(nextShots: StoryboardShot[]) {
-    setShots((current) => {
-      const merged = [...current, ...nextShots];
-      shotsRef.current = merged;
-      return merged;
-    });
   }
 
   function replaceShots(nextShots: StoryboardShot[]) {
@@ -621,7 +712,7 @@ function App() {
         phase: "storyboard",
         chunkTotal: resumeState.chunkTotal,
         completedChunks: resumeState.startChunkIndex,
-        completedShots: shotsRef.current.length
+              completedShots: countCompletedStoryboardShots(shotsRef.current)
       });
       const controller = new AbortController();
       setGenerationAbort(controller);
@@ -634,7 +725,7 @@ function App() {
         (event) => {
           lastGenerationEventAtRef.current = Date.now();
           if (event.type === "heartbeat") {
-            setStatus(`继续重试连接正常：已运行 ${event.elapsedSeconds} 秒，等待模型返回阶段结果`);
+            setStatus(`继续重试连接正常：已运行 ${event.elapsedSeconds} 秒，正在等待模型响应`);
           }
           if (event.type === "storyboard_started") {
             setProgress({
@@ -645,8 +736,24 @@ function App() {
             });
             setStatus(`继续重试：${event.completedChunks ?? resumeState.startChunkIndex}/${event.chunkTotal} 段`);
           }
+          if (event.type === "storyboard_chunk_started") {
+            setShots((current) => {
+              const next = markStoryboardChunkGenerating(current, event.chunkIndex);
+              shotsRef.current = next;
+              return next;
+            });
+            setStatus(`继续撰写第 ${event.chunkIndex + 1}/${event.chunkTotal} 段分镜提示词`);
+          }
+          if (event.type === "storyboard_retrying") {
+            const retryCause = /超时|timed out|timeout/i.test(event.reason) ? "响应超时" : "请求未完成";
+            setStatus(`第 ${event.chunkIndex + 1}/${event.chunkTotal} 段${retryCause}，正在拆分重试第 ${event.partIndex}/${event.partTotal} 个小段`);
+          }
           if (event.type === "storyboard_chunk") {
-            appendShots(event.shots);
+            setShots((current) => {
+              const next = replaceStoryboardChunkShots(current, event.chunkIndex, event.shots);
+              shotsRef.current = next;
+              return next;
+            });
             setProgress({
               phase: "storyboard",
               chunkTotal: event.chunkTotal,
@@ -655,14 +762,22 @@ function App() {
             });
             setStatus(`继续重试：${event.completedChunks}/${event.chunkTotal} 段，已生成 ${event.completedShots} 个镜头`);
           }
+          if (event.type === "storyboard_chunk_failed") {
+            const failedShots = failStoryboardChunkShots(shotsRef.current, event.chunkIndex, event.error);
+            replaceShots(failedShots);
+            setStatus(`第 ${event.chunkIndex + 1}/${event.chunkTotal} 段仍失败，已继续处理后续单元`);
+          }
           if (event.type === "storyboard_progress") {
             setStatus(`继续重试后台进度：已完成 ${event.finishedChunks}/${event.chunkTotal} 段，已显示到第 ${event.displayedChunks} 段`);
           }
           if (event.type === "done") {
             replaceShots(event.shots);
             setResumeState(null);
-            updateProgress((current) => current ? { ...current, phase: "done", completedShots: event.totalShots } : current);
-            setStatus(`完成：生成 ${event.totalShots} 个镜头`);
+            const failedCount = event.shots.filter((shot) => shot.generationStatus === "failed").length;
+            const completedCount = event.shots.filter((shot) => shot.generationStatus === "completed").length;
+            updateProgress((current) => current ? { ...current, phase: "done", completedShots: completedCount } : current);
+            setError(failedCount > 0 ? `${failedCount} 个分镜单元仍未生成，可直接点击对应分镜的重试按钮。` : "");
+            setStatus(failedCount > 0 ? `继续完成：${completedCount} 个镜头已生成，${failedCount} 个单元待处理` : `完成：生成 ${completedCount} 个镜头`);
             void saveCurrentProjectSnapshot({ shots: event.shots, status: "completed" });
           }
         },
@@ -670,7 +785,11 @@ function App() {
       );
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
-        setStatus("已取消继续重试，已保留当前结果");
+        const pausedShots = clearGeneratingStoryboardShots(shotsRef.current);
+        replaceShots(pausedShots);
+        const nextResumeState = buildResumeState("手动暂停", generationProgressRef.current, pausedShots);
+        setResumeState(nextResumeState);
+        setStatus("已暂停分镜生成，未完成单元已保留");
       } else {
         const message = err instanceof Error ? err.message : String(err);
         const nextResumeState = buildResumeState(message, generationProgressRef.current, shotsRef.current);
@@ -705,6 +824,73 @@ function App() {
       shotsRef.current = nextShots;
       return nextShots;
     });
+  }
+
+  async function regenerateShot(id: string) {
+    const target = shotsRef.current.find((shot) => shot.id === id);
+    if (!target || !analysis || isGenerating || regeneratingShotId) return;
+    setError("");
+    setRegeneratingShotId(id);
+    setShots((current) => {
+      const next = current.map((shot) => shot.id === id
+        ? { ...shot, generationStatus: "generating" as const, generationError: undefined }
+        : shot);
+      shotsRef.current = next;
+      return next;
+    });
+    try {
+      const result = await regenerateStoryboardShot(
+        target.sourceText,
+        settings,
+        analysis,
+        target.generationChunkIndex ?? 0
+      );
+      if (result.shots.length === 0) throw new Error("模型没有返回可替换的分镜。");
+      const generatedAt = Date.now();
+      const replacements = result.shots.map((shot, index) => ({
+        ...shot,
+        id: index === 0 ? id : `${id}-retry-${generatedAt}-${index}`,
+        index: target.index + index,
+        episodeNumber: target.episodeNumber,
+        generationChunkIndex: target.generationChunkIndex,
+        generationStatus: "completed" as const
+      }));
+      setShots((current) => {
+        const next = replaceStoryboardShotWithResults(current, id, replacements);
+        shotsRef.current = next;
+        return next;
+      });
+      setStatus(`镜头 ${target.index} 已重新生成`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setShots((current) => {
+        const next = current.map((shot) => shot.id === id
+          ? { ...shot, generationStatus: "failed" as const, generationError: message }
+          : shot);
+        shotsRef.current = next;
+        return next;
+      });
+      setError(`镜头 ${target.index} 重新生成失败：${message}`);
+    } finally {
+      setRegeneratingShotId(null);
+    }
+  }
+
+  function deleteShot(id: string) {
+    const target = shotsRef.current.find((shot) => shot.id === id);
+    if (!target || isGenerating || regeneratingShotId) return;
+    if (!window.confirm(`确定删除第 ${target.index} 个分镜吗？`)) return;
+    const remaining = shotsRef.current
+      .filter((shot) => shot.id !== id)
+      .map((shot, index) => ({ ...shot, index: index + 1 }));
+    replaceShots(recalculateShotDurations(
+      remaining,
+      settings.language,
+      settings.readingRate,
+      settings.readingRateUnit,
+      settings.episodeCount
+    ));
+    setStatus(`已删除分镜 ${target.index}`);
   }
 
   function downloadCsv() {
@@ -760,17 +946,13 @@ function App() {
   }
 
   function resetSample() {
-    setActiveProjectId("local-main");
-    setActiveSourceFilename(undefined);
-    setNovelText(sampleText);
-    setTranslatedText("");
-    setAnalysis(null);
-    setShots([]);
-    shotsRef.current = [];
-    setGenerationProgress(null);
-    generationProgressRef.current = null;
-    setResumeState(null);
-    setStatus("已载入示例文本");
+    const demoProject = createDemoProject();
+    applyProject(demoProject);
+    setRestored(false);
+    saveProject(demoProject)
+      .then(() => refreshProjectHistory())
+      .catch((err) => console.warn("保存演示项目失败", err));
+    setStatus("已载入演示记录");
   }
 
   return (
@@ -811,7 +993,11 @@ function App() {
             <span>模型</span>
             <div className="model-picker">
               {modelOptions.length > 0 && !useCustomModel ? (
-                <select value={modelInput} onChange={(event) => setModelInput(event.target.value)}>
+                <select value={modelInput} onChange={(event) => {
+                  setModelInput(event.target.value);
+                  setConnectionStatus("unknown");
+                  setConnectionMessage("模型已更改，请测试所选模型生成能力");
+                }}>
                   {modelOptions.map((model) => (
                     <option key={model} value={model}>{model}</option>
                   ))}
@@ -819,8 +1005,12 @@ function App() {
               ) : (
                 <input
                   value={modelInput}
-                  onChange={(event) => setModelInput(event.target.value)}
-                  placeholder="gpt-5.4"
+                  onChange={(event) => {
+                    setModelInput(event.target.value);
+                    setConnectionStatus("unknown");
+                    setConnectionMessage("模型已更改，请测试所选模型生成能力");
+                  }}
+                  placeholder={DEFAULT_MODEL}
                 />
               )}
               {modelOptions.length > 0 && (
@@ -836,7 +1026,11 @@ function App() {
               <input
                 type={showApiKey ? "text" : "password"}
                 value={apiKeyInput}
-                onChange={(event) => setApiKeyInput(event.target.value)}
+                onChange={(event) => {
+                  setApiKeyInput(event.target.value);
+                  setConnectionStatus("unknown");
+                  setConnectionMessage("API Key 已更改，请应用配置后重新测试模型");
+                }}
                 placeholder={config?.hasApiKey ? "已保存，可直接沿用" : "sk-..."}
               />
               <button type="button" onClick={() => setShowApiKey((value) => !value)} title={showApiKey ? "隐藏 API Key" : "显示 API Key"}>
@@ -846,57 +1040,79 @@ function App() {
           </label>
           <label className="field">
             <span>Base URL</span>
-            <input value={baseUrlInput} onChange={(event) => setBaseUrlInput(event.target.value)} placeholder="默认 OpenAI API" />
+            <input value={baseUrlInput} onChange={(event) => {
+              setBaseUrlInput(event.target.value);
+              setConnectionStatus("unknown");
+              setConnectionMessage("Base URL 已更改，请应用配置后重新测试模型");
+            }} placeholder="默认 OpenAI API" />
             <small>第三方网关请填写 OpenAI-compatible API 根地址，通常以 /v1 结尾，不是控制台首页。</small>
           </label>
-          <button className="secondary" onClick={saveRuntimeConfig} disabled={isSavingConfig}>
-            {isSavingConfig ? <Loader2 className="spin" size={17} /> : <Save size={17} />}
-            应用配置
-          </button>
-          <button className="secondary ghost" onClick={() => loadModels()} disabled={isLoadingModels || !config?.hasApiKey}>
-            {isLoadingModels ? <Loader2 className="spin" size={17} /> : <RefreshCw size={17} />}
-            读取模型
-          </button>
+          <div className="api-config-actions">
+            <button className="secondary" onClick={saveRuntimeConfig} disabled={isSavingConfig}>
+              {isSavingConfig ? <Loader2 className="spin" size={17} /> : <Save size={17} />}
+              应用配置
+            </button>
+            <button className="secondary ghost" onClick={() => loadModels()} disabled={isLoadingModels || !config?.hasApiKey}>
+              {isLoadingModels ? <Loader2 className="spin" size={17} /> : <RefreshCw size={17} />}
+              读取模型
+            </button>
+            <button className="secondary" onClick={testSelectedModel} disabled={isCheckingModel || isSavingConfig || !config?.hasApiKey}>
+              {isCheckingModel ? <Loader2 className="spin" size={17} /> : <Activity size={17} />}
+              测试模型
+            </button>
+          </div>
         </div>
       </section>
 
-      <section className="control-band">
-        <Segmented
-          label="视觉风格"
-          value={getVisualStyleControlValue(settings.visualStyle)}
-          options={visualStyles}
-          onChange={updateVisualStyle}
-        />
-        <label className="field custom-style-field">
-          <span>视觉描述</span>
-          <input
-            value={isCustomVisualStyle(settings.visualStyle) ? customVisualStyle || settings.visualStyle : renderVisualStyleLabel(settings.visualStyle)}
-            onChange={(event) => updateCustomVisualStyle(event.target.value)}
-            onFocus={() => {
-              if (!isCustomVisualStyle(settings.visualStyle)) {
-                updateCustomVisualStyle(renderVisualStyleLabel(settings.visualStyle));
-              }
-            }}
-            placeholder="例如：3D高精度CG、悬疑童话、赛博朋克电影感、水墨国风..."
+      <section className="settings-panel creative-settings">
+        <div className="settings-heading">
+          <div><p className="eyebrow">Creative Direction</p><h2>创作风格</h2></div>
+          <span>决定画面质感与叙事基调</span>
+        </div>
+        <div className="creative-grid">
+          <Segmented
+            label="视觉风格"
+            value={getVisualStyleControlValue(settings.visualStyle)}
+            options={visualStyles}
+            onChange={updateVisualStyle}
           />
-        </label>
-        <label className="field">
-          <span>剧本风格</span>
-          <select value={getScriptStyleControlValue(settings.scriptStyle)} onChange={(event) => updateScriptStyle(event.target.value)}>
-            {scriptStyles.map((style) => <option key={style}>{style}</option>)}
-            <option value="custom">自定义</option>
-          </select>
-        </label>
-        {isCustomScriptStyle(settings.scriptStyle) && (
-          <label className="field custom-style-field">
-            <span>自定义剧本</span>
-            <input
-              value={customScriptStyle || settings.scriptStyle}
-              onChange={(event) => updateCustomScriptStyle(event.target.value)}
-              placeholder="例如：悬念解谜、热血升级、黑色幽默..."
-            />
+          {isCustomVisualStyle(settings.visualStyle) && (
+            <label className="field custom-style-field">
+              <span>自定义视觉描述</span>
+              <input
+                autoFocus
+                value={customVisualStyle}
+                onChange={(event) => updateCustomVisualStyle(event.target.value)}
+                placeholder="例如：赛博朋克电影感、水墨国风、冷峻悬疑动画..."
+              />
+            </label>
+          )}
+          <label className="field script-style-field">
+            <span>剧本风格</span>
+            <select value={getScriptStyleControlValue(settings.scriptStyle)} onChange={(event) => updateScriptStyle(event.target.value)}>
+              {scriptStyles.map((style) => <option key={style}>{style}</option>)}
+              <option value="custom">自定义</option>
+            </select>
           </label>
-        )}
+          {isCustomScriptStyle(settings.scriptStyle) && (
+            <label className="field custom-style-field">
+              <span>自定义剧本</span>
+              <input
+                value={customScriptStyle || settings.scriptStyle}
+                onChange={(event) => updateCustomScriptStyle(event.target.value)}
+                placeholder="例如：悬念解谜、热血升级、黑色幽默..."
+              />
+            </label>
+          )}
+        </div>
+      </section>
+
+      <section className="settings-panel production-settings">
+        <div className="settings-heading">
+          <div><p className="eyebrow">Production Parameters</p><h2>制作参数</h2></div>
+          <span>语言与阅读节奏</span>
+        </div>
+        <div className="production-grid">
         <Segmented
           label="语言"
           value={settings.language}
@@ -937,6 +1153,7 @@ function App() {
             onChange={(event) => updateSettings({ episodeCount: clampInteger(event.target.value, 1, 999) })}
           />
         </label>
+        </div>
       </section>
 
       <section className="workspace">
@@ -1004,6 +1221,9 @@ function App() {
                     ? `理解阶段在第 ${resumeState.startChunkIndex + 1}/${resumeState.chunkTotal} 段中断；会保留当前文本和设置，重新尝试理解。`
                     : `从第 ${resumeState.startChunkIndex + 1}/${resumeState.chunkTotal} 段继续，保留已生成的 ${resumeState.completedShots} 个镜头。`}
                 </span>
+                {resumeState.error && (
+                  <span className="resume-error-detail">错误详情：{resumeState.error}</span>
+                )}
               </div>
               <button className="secondary" onClick={retryFailedStoryboard} disabled={isGenerating || (resumeState.phase === "storyboard" && !analysis)}>
                 {isGenerating ? <Loader2 className="spin" size={17} /> : <RotateCcw size={17} />}
@@ -1012,9 +1232,9 @@ function App() {
             </div>
           )}
           <div className="actions">
-            <button className="primary" onClick={runGeneration} disabled={isGenerating || connectionStatus === "checking"}>
+            <button className="primary" onClick={runGeneration} disabled={isGenerating}>
               {isGenerating ? <Loader2 className="spin" size={18} /> : <WandSparkles size={18} />}
-              {isGenerating ? "创作中" : "开始创作"}
+              {isGenerating ? (isTranslating ? "准备译文中" : "创作中") : "开始创作"}
             </button>
             {isGenerating && (
               <button className="secondary ghost" onClick={cancelGeneration} type="button">
@@ -1043,9 +1263,17 @@ function App() {
               <textarea
                 value={isTranslating && !translatedText ? "正在翻译为中文..." : translatedText}
                 onChange={(event) => setTranslatedText(event.target.value)}
-                placeholder={config?.hasApiKey ? "英文正文会自动翻译成中文，方便对照查看。" : "配置 API Key 后会自动生成中文译文。"}
+                    placeholder="英文正文会通过机器翻译接口生成中文译文，方便对照查看。"
                 spellCheck={false}
               />
+              {translationError && (
+                <div className="translation-error" role="alert">
+                  <span>{translationError}</span>
+                  <button type="button" className="secondary ghost" onClick={() => void runTranslation(novelText.trim())} disabled={isTranslating}>
+                    <RefreshCw size={15} /> 重试翻译
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -1091,6 +1319,15 @@ function App() {
         </div>
       </section>
 
+      <StoryboardTable
+        shots={numberedShots}
+        onChange={updateShot}
+        onRegenerate={(id) => void regenerateShot(id)}
+        onDelete={deleteShot}
+        isGenerating={isGenerating || Boolean(regeneratingShotId)}
+        regeneratingShotId={regeneratingShotId}
+      />
+
       <section className="history-panel">
         <div className="panel-head">
           <div>
@@ -1129,17 +1366,24 @@ function App() {
         )}
       </section>
 
-        <StoryboardTable shots={numberedShots} onChange={updateShot} />
     </main>
   );
 }
 
 function StoryboardTable({
   shots,
-  onChange
+  onChange,
+  onRegenerate,
+  onDelete,
+  isGenerating,
+  regeneratingShotId
 }: {
   shots: ReturnType<typeof numberStoryboardShots>;
   onChange: (id: string, field: keyof StoryboardShot, value: string) => void;
+  onRegenerate: (id: string) => void;
+  onDelete: (id: string) => void;
+  isGenerating: boolean;
+  regeneratingShotId: string | null;
 }) {
   if (shots.length === 0) {
     return (
@@ -1175,12 +1419,13 @@ function StoryboardTable({
               <th>场景</th>
               <th>情绪</th>
               <th>镜头秒数</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody>
             {shots.map(({ shot, episodeShotNumber, globalShotNumber }) => (
               <React.Fragment key={shot.id}>
-                <tr className="shot-main-row">
+                <tr className={`shot-main-row ${shot.generationStatus === "failed" ? "shot-failed" : ""}`}>
                   <td className="shot-index">{shot.episodeNumber}</td>
                   <td className="shot-index" title={`全片镜头 ${globalShotNumber}`}>{episodeShotNumber}</td>
                   <EditableText value={shot.narration} onChange={(value) => onChange(shot.id, "narration", value)} />
@@ -1192,9 +1437,31 @@ function StoryboardTable({
                   <EditableInput value={shot.scene} onChange={(value) => onChange(shot.id, "scene", value)} />
                   <EditableInput value={shot.emotion} onChange={(value) => onChange(shot.id, "emotion", value)} />
                   <td className="seconds">{shot.durationSeconds.toFixed(1)}</td>
+                  <td className="shot-actions">
+                    <button
+                      type="button"
+                      className="shot-action-button"
+                      title={shot.generationStatus === "failed" ? "重试此分镜" : "重新生成此分镜"}
+                      aria-label={shot.generationStatus === "failed" ? "重试此分镜" : "重新生成此分镜"}
+                      disabled={isGenerating}
+                      onClick={() => onRegenerate(shot.id)}
+                    >
+                      {regeneratingShotId === shot.id ? <Loader2 className="spin" size={16} /> : <RotateCcw size={16} />}
+                    </button>
+                    <button
+                      type="button"
+                      className="shot-action-button danger"
+                      title="删除此分镜"
+                      aria-label="删除此分镜"
+                      disabled={isGenerating}
+                      onClick={() => onDelete(shot.id)}
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </td>
                 </tr>
                 <tr className="prompt-row">
-                  <td colSpan={11}>
+                  <td colSpan={12}>
                     <div className="prompt-stage">
                       <div className="prompt-stage-head">
                         <div>
@@ -1204,12 +1471,21 @@ function StoryboardTable({
                             第 {shot.episodeNumber} 集 · 镜头 {episodeShotNumber} 提示词
                           </h3>
                         </div>
-                        <span>镜头 {shot.durationSeconds.toFixed(1)} 秒</span>
+                        <div className="prompt-stage-meta">
+                          {shot.generationStatus && shot.generationStatus !== "completed" && (
+                            <span className={`shot-generation-state ${shot.generationStatus}`}>
+                              {shot.generationStatus === "pending" ? "等待生成" : shot.generationStatus === "generating" ? "正在生成" : "生成失败"}
+                            </span>
+                          )}
+                          <span>镜头 {shot.durationSeconds.toFixed(1)} 秒</span>
+                        </div>
                       </div>
+                      {shot.generationError && <p className="shot-generation-error">{shot.generationError}</p>}
                       <textarea
                         className="prompt-textarea"
                         value={shot.prompt}
                         onChange={(event) => onChange(shot.id, "prompt", event.target.value)}
+                        placeholder={shot.generationStatus === "failed" ? "此单元失败，可点击重试生成提示词。" : shot.generationStatus === "pending" ? "分句已就位，等待依次撰写提示词。" : ""}
                       />
                     </div>
                   </td>
@@ -1309,19 +1585,25 @@ function buildResumeState(
       phase: "analysis",
       startChunkIndex: Math.max(0, startChunkIndex),
       chunkTotal: progress.chunkTotal,
-      completedShots: currentShots.length,
+      completedShots: currentShots.filter((shot) => shot.generationStatus === "completed").length,
       error: errorMessage
     };
   }
   if (progress.phase !== "storyboard") return null;
   const failedChunk = parseFailedStoryboardChunk(errorMessage);
-  const startChunkIndex = Math.min(failedChunk ?? progress.completedChunks, progress.completedChunks);
+  const pendingChunkIndexes = currentShots
+    .filter((shot) => shot.generationStatus === "pending" || shot.generationStatus === "generating")
+    .map((shot) => shot.generationChunkIndex)
+    .filter((index): index is number => typeof index === "number");
+  const startChunkIndex = pendingChunkIndexes.length > 0
+    ? Math.min(...pendingChunkIndexes)
+    : Math.min(failedChunk ?? progress.completedChunks, progress.completedChunks);
   if (startChunkIndex >= progress.chunkTotal) return null;
   return {
     phase: "storyboard",
     startChunkIndex: Math.max(0, startChunkIndex),
     chunkTotal: progress.chunkTotal,
-    completedShots: currentShots.length,
+    completedShots: currentShots.filter((shot) => shot.generationStatus === "completed").length,
     error: errorMessage
   };
 }
@@ -1441,18 +1723,6 @@ function readSavedApiConfig(): SavedApiConfig | null {
 
 function saveApiConfig(config: SavedApiConfig): void {
   window.localStorage.setItem(API_CONFIG_STORAGE_KEY, JSON.stringify(config));
-}
-
-function detectLanguageMode(text: string): StorySettings["language"] | null {
-  const clean = text.trim();
-  if (clean.length < 80) return null;
-
-  const cjkCount = clean.match(/[\u4e00-\u9fa5]/g)?.length ?? 0;
-  const latinWordCount = clean.match(/[A-Za-z]+(?:['-][A-Za-z]+)?/g)?.length ?? 0;
-
-  if (latinWordCount >= 40 && latinWordCount > cjkCount * 2) return "en";
-  if (cjkCount >= 40 && cjkCount > latinWordCount) return "zh";
-  return null;
 }
 
 function buildProject(

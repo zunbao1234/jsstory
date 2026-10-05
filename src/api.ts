@@ -4,6 +4,7 @@ import type {
   ConfigUpdateRequest,
   GenerationStreamEvent,
   ModelListResponse,
+  ModelConnectionCheckResponse,
   StorySettings,
   StoryboardResult,
   TranslationResponse
@@ -24,10 +25,18 @@ export async function fetchModels(): Promise<ModelListResponse> {
   return requestJson<ModelListResponse>("/api/models");
 }
 
-export async function translateNovel(text: string): Promise<TranslationResponse> {
+export async function checkModelConnection(model: string): Promise<ModelConnectionCheckResponse> {
+  return requestJson<ModelConnectionCheckResponse>("/api/models/check", {
+    method: "POST",
+    body: JSON.stringify({ model })
+  });
+}
+
+export async function translateNovel(text: string, signal?: AbortSignal): Promise<TranslationResponse> {
   return requestJson<TranslationResponse>("/api/translate", {
     method: "POST",
-    body: JSON.stringify({ text })
+    body: JSON.stringify({ text }),
+    signal
   });
 }
 
@@ -74,6 +83,18 @@ export async function resumeStoryboardStream(
     existingShots,
     startChunkIndex
   }, onEvent, signal);
+}
+
+export async function regenerateStoryboardShot(
+  sourceText: string,
+  settings: StorySettings,
+  analysis: AnalysisResult,
+  generationChunkIndex = 0
+): Promise<StoryboardResult> {
+  return requestJson<StoryboardResult>("/api/storyboard/regenerate", {
+    method: "POST",
+    body: JSON.stringify({ sourceText, settings, analysis, generationChunkIndex })
+  });
 }
 
 async function readGenerationStream(
